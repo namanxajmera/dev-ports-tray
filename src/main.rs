@@ -25,7 +25,6 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 struct ProcessInfo {
     pid: i32,
     ports: BTreeSet<u16>,
-    name: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -287,22 +286,11 @@ fn perform_scan() -> Result<ProcessSnapshot> {
             .collect();
 
         if !ports.is_empty() {
-            let name = process_name(pid).unwrap_or_else(|_| "?".to_string());
-            pid_to_info.insert(pid, ProcessInfo { pid, ports, name });
+            pid_to_info.insert(pid, ProcessInfo { pid, ports });
         }
     }
 
     Ok(ProcessSnapshot { processes: pid_to_info })
-}
-
-fn process_name(pid: i32) -> Result<String> {
-    let cmd = format!("ps -p {} -o comm=", pid);
-    let out = Command::new("sh").arg("-lc").arg(&cmd).output()?;
-    if !out.status.success() {
-        return Err(anyhow!("ps failed for pid {}", pid));
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(if s.is_empty() { "?".into() } else { s })
 }
 
 fn terminate_process(pid: i32) -> Result<()> {
