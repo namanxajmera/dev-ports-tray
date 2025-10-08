@@ -14,6 +14,9 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::event::Event;
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+
 const PORT_START: u16 = 3000;
 const PORT_END: u16 = 10000; // inclusive
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
@@ -52,8 +55,17 @@ enum MonitorCmd {
 }
 
 fn main() {
+
     // Build winit event loop with custom user events
+    #[cfg(target_os = "macos")]
+    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event()
+        .with_activation_policy(ActivationPolicy::Accessory)
+        .build()
+        .unwrap();
+
+    #[cfg(not(target_os = "macos"))]
     let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build().unwrap();
+
     let proxy = event_loop.create_proxy();
 
     // Build tray icon with a visible red dot and initial menu
@@ -116,7 +128,6 @@ fn main() {
         rebuild_dynamic_menu(&mut tray, &snap, &menu_state);
         last_built_menu_snapshot = Some(snap);
     }
-
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Wait);
         match event {
@@ -254,37 +265,34 @@ fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorC
 fn perform_scan() -> Result<ProcessSnapshot> {
     let mut pid_to_info: HashMap<i32, ProcessInfo> = HashMap::new();
 
-    for port in PORT_START..=PORT_END {
-        let pids = lsof_listening_pids(port)?;
-        for pid in pids {
-            let entry = pid_to_info.entry(pid).or_insert_with(|| ProcessInfo {
-                pid,
-                ports: BTreeSet::new(),
-                name: process_name(pid).unwrap_or_else(|_| "?".to_string()),
-            });
-            entry.ports.insert(port);
+    // Use lsof with port range for much faster scanning
+    let cmd = format!("lsof -ti :{PORT_START}-{PORT_END} -sTCP:LISTEN 2>/dev/null");
+    let output = Command::new("sh").arg("-lc").arg(&cmd).output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pids: BTreeSet<i32> = stdout
+        .lines()
+        .filter_map(|line| i32::from_str(line.trim()).ok())
+        .collect();
+
+    // For each PID, find which specific ports it's listening on
+    for &pid in &pids {
+        let port_cmd = format!("lsof -Pan -p {pid} -iTCP -sTCP:LISTEN 2>/dev/null | awk '{{print $9}}' | grep -oE '[0-9]+$'");
+        let port_output = Command::new("sh").arg("-lc").arg(&port_cmd).output()?;
+
+        let ports: BTreeSet<u16> = String::from_utf8_lossy(&port_output.stdout)
+            .lines()
+            .filter_map(|line| u16::from_str(line.trim()).ok())
+            .filter(|&p| p >= PORT_START && p <= PORT_END)
+            .collect();
+
+        if !ports.is_empty() {
+            let name = process_name(pid).unwrap_or_else(|_| "?".to_string());
+            pid_to_info.insert(pid, ProcessInfo { pid, ports, name });
         }
     }
 
     Ok(ProcessSnapshot { processes: pid_to_info })
-}
-
-fn lsof_listening_pids(port: u16) -> Result<Vec<i32>> {
-    // Use sh -lc to allow redirection of stderr
-    let cmd = format!("lsof -ti :{port} -sTCP:LISTEN 2>/dev/null");
-    let out = Command::new("sh").arg("-lc").arg(&cmd).output()?;
-    if !out.status.success() && out.stdout.is_empty() {
-        // Non-zero exit might mean no processes (lsof returns 1 sometimes). Treat as none.
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut set = BTreeSet::new();
-    for line in stdout.lines() {
-        if let Ok(pid) = i32::from_str(line.trim()) {
-            set.insert(pid);
-        }
-    }
-    Ok(set.into_iter().collect())
 }
 
 fn process_name(pid: i32) -> Result<String> {
@@ -332,7 +340,7 @@ fn terminate_process(pid: i32) -> Result<()> {
 
 fn update_tray_ui(tray: &mut TrayIcon, snap: &ProcessSnapshot) {
     let count = snap.count();
-    let title = if count == 0 { "0".to_string() } else { format!("{}⚠️", count) };
+    let title = count.to_string();
     let _ = tray.set_title(Some(&title));
 
     if count == 0 {
@@ -355,20 +363,8 @@ fn update_tray_ui(tray: &mut TrayIcon, snap: &ProcessSnapshot) {
 }
 
 fn rebuild_dynamic_menu(tray: &mut TrayIcon, snap: &ProcessSnapshot, menu_state: &Arc<Mutex<MenuState>>) {
-    // Recreate the menu fresh: Kill All, Quit, separator, then process entries
+    // Recreate the menu fresh: process entries first, separator, then Kill All and Quit at bottom
     let menu = Menu::new();
-    let kill_all = MenuItem::new("Kill All Processes", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let _ = menu.append(&kill_all);
-    let _ = menu.append(&quit);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // Reset and store new IDs
-    if let Ok(mut state) = menu_state.lock() {
-        state.kill_all = kill_all.id().clone();
-        state.quit = quit.id().clone();
-        state.pid_by_id.clear();
-    }
 
     // Sort by smallest port for each pid to display a stable order
     let mut entries: Vec<(u16, &ProcessInfo)> = Vec::new();
@@ -378,13 +374,29 @@ fn rebuild_dynamic_menu(tray: &mut TrayIcon, snap: &ProcessSnapshot, menu_state:
     }
     entries.sort_by_key(|(p, _)| *p);
 
+    // Add port items first
     for (port, info) in entries {
-        let label = format!("Kill: Port {}", port);
+        let label = format!("Kill Port {}", port);
         let item = MenuItem::new(&label, true, None);
         let _ = menu.append(&item);
         if let Ok(mut state) = menu_state.lock() {
             state.pid_by_id.insert(item.id().clone(), info.pid);
         }
+    }
+
+    // Add separator
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
+    // Add Kill All and Quit at the bottom
+    let kill_all = MenuItem::new("Kill All", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+    let _ = menu.append(&kill_all);
+    let _ = menu.append(&quit);
+
+    // Reset and store new IDs
+    if let Ok(mut state) = menu_state.lock() {
+        state.kill_all = kill_all.id().clone();
+        state.quit = quit.id().clone();
     }
 
     let _ = tray.set_menu(Some(Box::new(menu)));
