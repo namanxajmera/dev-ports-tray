@@ -40,7 +40,7 @@ struct ProcessInfo {
     ports: BTreeSet<u16>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ProcessSnapshot {
     // pid -> info
     processes: HashMap<i32, ProcessInfo>,
@@ -54,7 +54,7 @@ impl ProcessSnapshot {
 
 #[derive(Debug, Clone)]
 enum AppEvent {
-    UpdateSnapshot(ProcessSnapshot),
+    UpdateSnapshot(Arc<ProcessSnapshot>),
     MenuKillAll,
     MenuQuit,
     MenuKillPid(i32),
@@ -67,30 +67,53 @@ enum MonitorCmd {
 }
 
 fn main() {
-
     // Build winit event loop with custom user events
     #[cfg(target_os = "macos")]
-    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event()
+    let event_loop: EventLoop<AppEvent> = match EventLoopBuilder::with_user_event()
         .with_activation_policy(ActivationPolicy::Accessory)
         .build()
-        .unwrap();
+    {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("Failed to create event loop: {}. The system may not support the required windowing features.", e);
+            std::process::exit(1);
+        }
+    };
 
     #[cfg(not(target_os = "macos"))]
-    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build().unwrap();
+    let event_loop: EventLoop<AppEvent> = match EventLoopBuilder::with_user_event().build() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("Failed to create event loop: {}. The system may not support the required windowing features.", e);
+            std::process::exit(1);
+        }
+    };
 
     let proxy = event_loop.create_proxy();
 
     // Build tray icon with a visible red dot and initial menu
-    let icon = make_red_dot_icon(18);
+    let icon = match make_red_dot_icon(18) {
+        Ok(icon) => icon,
+        Err(e) => {
+            eprintln!("Failed to create tray icon: {}", e);
+            std::process::exit(1);
+        }
+    };
     let tray_menu = Menu::new();
 
-    let mut tray = TrayIconBuilder::new()
+    let mut tray = match TrayIconBuilder::new()
         .with_icon(icon)
         .with_menu(Box::new(tray_menu))
         .with_tooltip("No dev servers detected")
         .with_title("0")
         .build()
-        .expect("tray icon");
+    {
+        Ok(tray) => tray,
+        Err(e) => {
+            eprintln!("Failed to create tray icon: {}. Please check system tray permissions.", e);
+            std::process::exit(1);
+        }
+    };
 
     // Crossbeam channel for monitor thread commands
     let (mon_tx, mon_rx) = channel::unbounded::<MonitorCmd>();
@@ -125,14 +148,15 @@ fn main() {
     });
 
     // Keep a cache of current snapshot for rebuilding menu and computing counts
-    let mut current_snapshot = ProcessSnapshot::default();
+    let mut current_snapshot = Arc::new(ProcessSnapshot::default());
 
     // Track last snapshot used for the menu to avoid unnecessary rebuilds while hovering
-    let mut last_built_menu_snapshot: Option<ProcessSnapshot> = None;
+    let mut last_built_menu_snapshot: Option<Arc<ProcessSnapshot>> = None;
 
     // Initial manual scan for immediate UI
     if let Ok(snap) = perform_scan() {
-        current_snapshot = snap.clone();
+        let snap = Arc::new(snap);
+        current_snapshot = Arc::clone(&snap);
         update_tray_ui(&mut tray, &snap);
         rebuild_dynamic_menu(&mut tray, &snap, &menu_state);
         last_built_menu_snapshot = Some(snap);
@@ -141,7 +165,7 @@ fn main() {
         elwt.set_control_flow(ControlFlow::Wait);
         match event {
             Event::UserEvent(AppEvent::UpdateSnapshot(snap)) => {
-                current_snapshot = snap.clone();
+                current_snapshot = Arc::clone(&snap);
                 update_tray_ui(&mut tray, &snap);
                 if last_built_menu_snapshot.as_ref() != Some(&snap) {
                     rebuild_dynamic_menu(&mut tray, &snap, &menu_state);
@@ -196,7 +220,15 @@ fn main() {
     });
 }
 
-fn make_red_dot_icon(size: u32) -> Icon {
+fn make_red_dot_icon(size: u32) -> Result<Icon> {
+    // Validate size to prevent excessive memory allocation
+    if size == 0 {
+        return Err(anyhow!("Icon size must be greater than 0"));
+    }
+    if size > 1024 {
+        return Err(anyhow!("Icon size {} is too large (max 1024)", size));
+    }
+
     let w = size as usize;
     let h = size as usize;
     let mut rgba = vec![0u8; w * h * 4];
@@ -219,7 +251,8 @@ fn make_red_dot_icon(size: u32) -> Icon {
             }
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("red dot icon")
+    Icon::from_rgba(rgba, size, size)
+        .map_err(|e| anyhow!("Failed to create icon from RGBA data: {}", e))
 }
 
 #[derive(Default)]
@@ -256,13 +289,13 @@ fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorC
                 last_scan = Instant::now();
                 match perform_scan() {
                     Ok(snap) => {
-                        let _ = proxy.send_event(AppEvent::UpdateSnapshot(snap));
+                        let _ = proxy.send_event(AppEvent::UpdateSnapshot(Arc::new(snap)));
                     }
                     Err(e) => {
                         eprintln!("Scan error: {e:?}");
                         // Still send an empty snapshot to keep UI responsive
                         let _ = proxy.send_event(AppEvent::UpdateSnapshot(
-                            ProcessSnapshot::default(),
+                            Arc::new(ProcessSnapshot::default()),
                         ));
                     }
                 }
@@ -271,40 +304,110 @@ fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorC
     });
 }
 
+fn run_command_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd, e))?;
+
+    let pid = child.id();
+    let start = Instant::now();
+
+    // Poll for completion with timeout
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                // Process completed, collect output
+                let output = child.wait_with_output()
+                    .map_err(|e| anyhow!("Failed to read output: {}", e))?;
+                return Ok(output);
+            }
+            Ok(None) => {
+                // Still running, check timeout
+                if start.elapsed() > timeout {
+                    // Timeout exceeded, kill the process
+                    let _ = child.kill();
+                    let _ = child.wait(); // Clean up zombie
+                    return Err(anyhow!(
+                        "Command '{}' timed out after {:?}",
+                        cmd,
+                        timeout
+                    ));
+                }
+                // Sleep briefly before next check
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(anyhow!("Error waiting for command: {}", e));
+            }
+        }
+    }
+}
+
 fn perform_scan() -> Result<ProcessSnapshot> {
     let mut pid_to_info: HashMap<i32, ProcessInfo> = HashMap::new();
 
-    // Build port list string for lsof (e.g., ":3000,:3001,:4200,...")
-    let port_list = DEV_PORTS
-        .iter()
-        .map(|p| format!(":{}", p))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    // Use lsof with specific ports for focused scanning
-    let cmd = format!("lsof -ti {} -sTCP:LISTEN 2>/dev/null", port_list);
-    let output = Command::new("sh").arg("-lc").arg(&cmd).output()?;
+    // Use a single lsof command to get all listening TCP processes
+    // -nP: no hostname/service name resolution (faster)
+    // -iTCP: only TCP connections
+    // -sTCP:LISTEN: only listening sockets
+    // Timeout after 5 seconds to prevent hanging
+    let output = run_command_with_timeout("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"], Duration::from_secs(5))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pids: BTreeSet<i32> = stdout
-        .lines()
-        .filter_map(|line| i32::from_str(line.trim()).ok())
-        .collect();
 
-    // For each PID, find which specific ports it's listening on
-    for &pid in &pids {
-        let port_cmd = format!("lsof -Pan -p {pid} -iTCP -sTCP:LISTEN 2>/dev/null | awk '{{print $9}}' | grep -oE '[0-9]+$'");
-        let port_output = Command::new("sh").arg("-lc").arg(&port_cmd).output()?;
+    // Parse lsof output line by line
+    // Format: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+    // Example: node    12345 user 20u IPv4 0x123456 0t0 TCP *:3000 (LISTEN)
+    for line in stdout.lines().skip(1) {  // Skip header line
+        let parts: Vec<&str> = line.split_whitespace().collect();
 
-        let ports: BTreeSet<u16> = String::from_utf8_lossy(&port_output.stdout)
-            .lines()
-            .filter_map(|line| u16::from_str(line.trim()).ok())
-            .filter(|&p| DEV_PORTS.contains(&p))
-            .collect();
-
-        if !ports.is_empty() {
-            pid_to_info.insert(pid, ProcessInfo { pid, ports });
+        // Need at least: COMMAND PID ... NAME
+        if parts.len() < 9 {
+            continue;
         }
+
+        // Extract PID (column 1, 0-indexed)
+        let pid = match i32::from_str(parts[1]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Extract port from NAME column (last column)
+        // Format can be: "*:3000" or "127.0.0.1:3000" or "[::]:3000"
+        let name = parts[parts.len() - 2];  // -2 because last is often "(LISTEN)"
+        let port = if let Some(colon_pos) = name.rfind(':') {
+            match u16::from_str(&name[colon_pos + 1..]) {
+                Ok(p) => p,
+                Err(_) => continue,
+            }
+        } else {
+            continue;
+        };
+
+        // Only track ports we care about
+        if !DEV_PORTS.contains(&port) {
+            continue;
+        }
+
+        // Add to or update the process info
+        pid_to_info
+            .entry(pid)
+            .or_insert_with(|| ProcessInfo {
+                pid,
+                ports: BTreeSet::new(),
+            })
+            .ports
+            .insert(port);
     }
 
     Ok(ProcessSnapshot { processes: pid_to_info })
