@@ -17,8 +17,21 @@ use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
-const PORT_START: u16 = 3000;
-const PORT_END: u16 = 10000; // inclusive
+// Common development server ports
+const DEV_PORTS: &[u16] = &[
+    3000, // React, Next.js, create-react-app
+    3001, // alternate React
+    4200, // Angular
+    5000, // Flask, various tools
+    5173, // Vite
+    5174, // Vite alternate
+    8000, // Django, Python HTTP server
+    8080, // common HTTP alternative
+    8081, // common alternative
+    8888, // Jupyter Notebook
+    9000, // various tools
+    9090, // Prometheus
+];
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,10 +87,7 @@ fn main() {
     let mut tray = TrayIconBuilder::new()
         .with_icon(icon)
         .with_menu(Box::new(tray_menu))
-        .with_tooltip(&format!(
-            "No dev servers on ports {}-{}",
-            PORT_START, PORT_END
-        ))
+        .with_tooltip("No dev servers detected")
         .with_title("0")
         .build()
         .expect("tray icon");
@@ -264,8 +274,15 @@ fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorC
 fn perform_scan() -> Result<ProcessSnapshot> {
     let mut pid_to_info: HashMap<i32, ProcessInfo> = HashMap::new();
 
-    // Use lsof with port range for much faster scanning
-    let cmd = format!("lsof -ti :{PORT_START}-{PORT_END} -sTCP:LISTEN 2>/dev/null");
+    // Build port list string for lsof (e.g., ":3000,:3001,:4200,...")
+    let port_list = DEV_PORTS
+        .iter()
+        .map(|p| format!(":{}", p))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Use lsof with specific ports for focused scanning
+    let cmd = format!("lsof -ti {} -sTCP:LISTEN 2>/dev/null", port_list);
     let output = Command::new("sh").arg("-lc").arg(&cmd).output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -282,7 +299,7 @@ fn perform_scan() -> Result<ProcessSnapshot> {
         let ports: BTreeSet<u16> = String::from_utf8_lossy(&port_output.stdout)
             .lines()
             .filter_map(|line| u16::from_str(line.trim()).ok())
-            .filter(|&p| p >= PORT_START && p <= PORT_END)
+            .filter(|&p| DEV_PORTS.contains(&p))
             .collect();
 
         if !ports.is_empty() {
@@ -332,7 +349,7 @@ fn update_tray_ui(tray: &mut TrayIcon, snap: &ProcessSnapshot) {
     let _ = tray.set_title(Some(&title));
 
     if count == 0 {
-        let _ = tray.set_tooltip(Some("No dev servers 3000-10000"));
+        let _ = tray.set_tooltip(Some("No dev servers detected"));
     } else {
         // Compact tooltip: list one port per PID
         let mut ports_list: Vec<u16> = snap
