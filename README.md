@@ -18,7 +18,21 @@ A lightweight macOS status bar app that monitors common development server ports
 - Rust toolchain ([install via rustup](https://rustup.rs/))
 - `lsof` (included in macOS)
 
-### Build and Run
+### Quick Install (Recommended)
+
+Run the installation script to build and install the app to your `/Applications` folder:
+
+```bash
+./install.sh
+```
+
+This will:
+1. Build the release binary
+2. Create a standalone macOS app bundle (`DevPortsTray.app`)
+3. Install it to `/Applications`
+
+### Manual Build
+
 ```sh
 git clone https://github.com/namanxajmera/dev-ports-tray.git
 cd dev-ports-tray

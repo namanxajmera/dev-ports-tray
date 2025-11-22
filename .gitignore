@@ -1,3 +1,9 @@
 target
 .DS_Store
 .claude/
+
+# Build artifacts
+*.app/
+icon.svg
+icon.png
+icon.iconset/
