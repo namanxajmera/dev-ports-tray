@@ -4,9 +4,10 @@ A lightweight macOS status bar app that monitors common development server ports
 
 ## Features
 
-- **Live Port Monitoring** – Scans common dev ports (3000, 3001, 4200, 5000, 5173, 5174, 8000, 8080, 8081, 8888, 9000, 9090) every 2 seconds
+- **Live Port Monitoring** – Scans common dev ports (configurable) every 2 seconds
 - **Status Bar Integration** – Shows `0` when clear or `N` when N processes detected
 - **Quick Actions** – Kill individual processes or all at once from the menu bar
+- **Configurable** – Add or remove ports directly from the menu (persisted to disk)
 - **Safe Termination** – Sends SIGTERM first, waits 2s, then SIGKILL if needed
 - **Lightweight** – Native Rust, minimal memory footprint, single optimized lsof command
 
@@ -33,6 +34,8 @@ Once running, the app displays:
 - **Tooltip**: Hover to see which ports are in use
 - **Menu**: Click the icon to see:
   - Individual port options (e.g., `Kill Port 3000`) – Terminate specific process
+  - `Add Port...` – Monitor a new port
+  - `Remove Port` – Stop monitoring a specific port
   - `Kill All` – Terminate all detected processes
   - `Quit` – Exit the app
 
@@ -50,16 +53,6 @@ Built with Rust using:
 
 ### Customization
 
-To modify which ports are monitored, edit the `DEV_PORTS` constant in `src/main.rs` (around line 21):
-
-```rust
-const DEV_PORTS: &[u16] = &[
-    3000, // React, Next.js
-    5173, // Vite
-    8080, // Common HTTP
-    // Add your ports here...
-];
-```
 
 ### Performance Optimizations
 

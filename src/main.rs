@@ -17,21 +17,10 @@ use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
-// Common development server ports
-const DEV_PORTS: &[u16] = &[
-    3000, // React, Next.js, create-react-app
-    3001, // alternate React
-    4200, // Angular
-    5000, // Flask, various tools
-    5173, // Vite
-    5174, // Vite alternate
-    8000, // Django, Python HTTP server
-    8080, // common HTTP alternative
-    8081, // common alternative
-    8888, // Jupyter Notebook
-    9000, // various tools
-    9090, // Prometheus
-];
+mod config;
+
+use crate::config::Config;
+
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +47,8 @@ enum AppEvent {
     MenuKillAll,
     MenuQuit,
     MenuKillPid(i32),
+    MenuAddPort,
+    MenuRemovePort(u16),
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +112,15 @@ fn main() {
     // Shared state for mapping menu item IDs to actions/PIDs
     let menu_state = Arc::new(Mutex::new(MenuState::default()));
 
+    // Load config
+    let config = Config::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {}", e);
+        Config::default()
+    });
+    let config = Arc::new(Mutex::new(config));
+
     // Spawn monitor thread which periodically scans and posts UI updates
-    spawn_monitor(proxy.clone(), mon_rx);
+    spawn_monitor(proxy.clone(), mon_rx, Arc::clone(&config));
 
     // Spawn a thread to receive menu events and send user events
     let menu_proxy = proxy.clone();
@@ -140,6 +138,14 @@ fn main() {
                     let _ = menu_proxy.send_event(AppEvent::MenuQuit);
                     continue;
                 }
+                if event.id == state.add_port {
+                    let _ = menu_proxy.send_event(AppEvent::MenuAddPort);
+                    continue;
+                }
+                if let Some(&port) = state.remove_port_ids.get(&event.id) {
+                    let _ = menu_proxy.send_event(AppEvent::MenuRemovePort(port));
+                    continue;
+                }
                 if let Some(&pid) = state.pid_by_id.get(&event.id) {
                     let _ = menu_proxy.send_event(AppEvent::MenuKillPid(pid));
                 }
@@ -154,12 +160,15 @@ fn main() {
     let mut last_built_menu_snapshot: Option<Arc<ProcessSnapshot>> = None;
 
     // Initial manual scan for immediate UI
-    if let Ok(snap) = perform_scan() {
-        let snap = Arc::new(snap);
-        current_snapshot = Arc::clone(&snap);
-        update_tray_ui(&mut tray, &snap);
-        rebuild_dynamic_menu(&mut tray, &snap, &menu_state);
-        last_built_menu_snapshot = Some(snap);
+    {
+        let config_guard = config.lock().unwrap();
+        if let Ok(snap) = perform_scan(&config_guard) {
+            let snap = Arc::new(snap);
+            current_snapshot = Arc::clone(&snap);
+            update_tray_ui(&mut tray, &snap);
+            rebuild_dynamic_menu(&mut tray, &snap, &menu_state, &config_guard);
+            last_built_menu_snapshot = Some(snap);
+        }
     }
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Wait);
@@ -168,7 +177,8 @@ fn main() {
                 current_snapshot = Arc::clone(&snap);
                 update_tray_ui(&mut tray, &snap);
                 if last_built_menu_snapshot.as_ref() != Some(&snap) {
-                    rebuild_dynamic_menu(&mut tray, &snap, &menu_state);
+                    let config_guard = config.lock().unwrap();
+                    rebuild_dynamic_menu(&mut tray, &snap, &menu_state, &config_guard);
                     last_built_menu_snapshot = Some(snap);
                 }
             }
@@ -215,6 +225,28 @@ fn main() {
                 let _ = mon_tx.send(MonitorCmd::Shutdown);
                 elwt.exit();
             }
+            Event::UserEvent(AppEvent::MenuAddPort) => {
+                if let Some(port) = prompt_for_port() {
+                    let mut config_guard = config.lock().unwrap();
+                    if let Err(e) = config_guard.add_port(port) {
+                        eprintln!("Failed to add port: {}", e);
+                    } else {
+                        // Force a menu rebuild immediately to show the new port in "Remove" list
+                        // And trigger a rescan
+                        rebuild_dynamic_menu(&mut tray, &current_snapshot, &menu_state, &config_guard);
+                        let _ = mon_tx.send(MonitorCmd::RescanNow);
+                    }
+                }
+            }
+            Event::UserEvent(AppEvent::MenuRemovePort(port)) => {
+                let mut config_guard = config.lock().unwrap();
+                if let Err(e) = config_guard.remove_port(port) {
+                    eprintln!("Failed to remove port: {}", e);
+                } else {
+                    rebuild_dynamic_menu(&mut tray, &current_snapshot, &menu_state, &config_guard);
+                    let _ = mon_tx.send(MonitorCmd::RescanNow);
+                }
+            }
             _ => {}
         }
     });
@@ -259,10 +291,12 @@ fn make_red_dot_icon(size: u32) -> Result<Icon> {
 struct MenuState {
     kill_all: MenuId,
     quit: MenuId,
+    add_port: MenuId,
     pid_by_id: HashMap<MenuId, i32>,
+    remove_port_ids: HashMap<MenuId, u16>,
 }
 
-fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorCmd>) {
+fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorCmd>, config: Arc<Mutex<Config>>) {
     thread::spawn(move || {
         // Use a loop with timeout-based select to scan every 2s, or on demand.
         let mut last_scan = Instant::now() - SCAN_INTERVAL;
@@ -287,7 +321,8 @@ fn spawn_monitor(proxy: EventLoopProxy<AppEvent>, rx: channel::Receiver<MonitorC
 
             if scan_now {
                 last_scan = Instant::now();
-                match perform_scan() {
+                let config_guard = config.lock().unwrap();
+                match perform_scan(&config_guard) {
                     Ok(snap) => {
                         let _ = proxy.send_event(AppEvent::UpdateSnapshot(Arc::new(snap)));
                     }
@@ -318,7 +353,6 @@ fn run_command_with_timeout(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd, e))?;
 
-    let pid = child.id();
     let start = Instant::now();
 
     // Poll for completion with timeout
@@ -353,64 +387,105 @@ fn run_command_with_timeout(
     }
 }
 
-fn perform_scan() -> Result<ProcessSnapshot> {
-    let mut pid_to_info: HashMap<i32, ProcessInfo> = HashMap::new();
-
-    // Use a single lsof command to get all listening TCP processes
-    // -nP: no hostname/service name resolution (faster)
-    // -iTCP: only TCP connections
+fn perform_scan(config: &Config) -> Result<ProcessSnapshot> {
+    // Use lsof with -F flag for machine-readable output
+    // -n: no hostname resolution
+    // -P: no port name resolution
+    // -iTCP: only TCP
     // -sTCP:LISTEN: only listening sockets
-    // Timeout after 5 seconds to prevent hanging
-    let output = run_command_with_timeout("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"], Duration::from_secs(5))?;
+    // -F pcn: select fields PID (p), Command (c), Name (n)
+    let output = run_command_with_timeout(
+        "lsof",
+        &["-n", "-P", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
+        Duration::from_secs(5),
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let processes = parse_lsof_output(&stdout, &config.ports);
 
-    // Parse lsof output line by line
-    // Format: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-    // Example: node    12345 user 20u IPv4 0x123456 0t0 TCP *:3000 (LISTEN)
-    for line in stdout.lines().skip(1) {  // Skip header line
-        let parts: Vec<&str> = line.split_whitespace().collect();
+    Ok(ProcessSnapshot { processes })
+}
 
-        // Need at least: COMMAND PID ... NAME
-        if parts.len() < 9 {
+fn parse_lsof_output(output: &str, monitored_ports: &[u16]) -> HashMap<i32, ProcessInfo> {
+    let mut pid_to_info: HashMap<i32, ProcessInfo> = HashMap::new();
+    let mut current_pid: Option<i32> = None;
+
+    for line in output.lines() {
+        if line.is_empty() {
             continue;
         }
 
-        // Extract PID (column 1, 0-indexed)
-        let pid = match i32::from_str(parts[1]) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+        let first_char = line.chars().next().unwrap();
+        let content = &line[1..];
 
-        // Extract port from NAME column (last column)
-        // Format can be: "*:3000" or "127.0.0.1:3000" or "[::]:3000"
-        let name = parts[parts.len() - 2];  // -2 because last is often "(LISTEN)"
-        let port = if let Some(colon_pos) = name.rfind(':') {
-            match u16::from_str(&name[colon_pos + 1..]) {
-                Ok(p) => p,
-                Err(_) => continue,
+        match first_char {
+            'p' => {
+                // New process block
+                if let Ok(pid) = i32::from_str(content) {
+                    current_pid = Some(pid);
+                } else {
+                    current_pid = None;
+                }
             }
-        } else {
-            continue;
-        };
-
-        // Only track ports we care about
-        if !DEV_PORTS.contains(&port) {
-            continue;
+            'n' => {
+                // Name field: usually "IP:PORT" or "*:PORT"
+                // Example: "*:3000", "127.0.0.1:8080", "[::1]:5000"
+                if let Some(pid) = current_pid {
+                    if let Some(colon_pos) = content.rfind(':') {
+                        if let Ok(port) = u16::from_str(&content[colon_pos + 1..]) {
+                            if monitored_ports.contains(&port) {
+                                pid_to_info
+                                    .entry(pid)
+                                    .or_insert_with(|| ProcessInfo {
+                                        pid,
+                                        ports: BTreeSet::new(),
+                                    })
+                                    .ports
+                                    .insert(port);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Ignore other fields (c, f, etc.)
+            }
         }
-
-        // Add to or update the process info
-        pid_to_info
-            .entry(pid)
-            .or_insert_with(|| ProcessInfo {
-                pid,
-                ports: BTreeSet::new(),
-            })
-            .ports
-            .insert(port);
     }
 
-    Ok(ProcessSnapshot { processes: pid_to_info })
+    pid_to_info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_lsof_output() {
+        let output = "p123\ncnode\nf10\nn*:3000\np456\ncpython\nf11\nn127.0.0.1:8080\nf12\nn[::]:9000";
+        let ports = vec![3000, 8080, 9000];
+        let info = parse_lsof_output(output, &ports);
+
+        assert_eq!(info.len(), 2);
+        
+        let p123 = info.get(&123).unwrap();
+        assert!(p123.ports.contains(&3000));
+
+        let p456 = info.get(&456).unwrap();
+        assert!(p456.ports.contains(&8080));
+        assert!(p456.ports.contains(&9000));
+    }
+
+    #[test]
+    fn test_parse_lsof_ignores_unmonitored() {
+        let output = "p123\nn*:3000\np456\nn*:9999";
+        let ports = vec![3000];
+        let info = parse_lsof_output(output, &ports);
+
+        assert_eq!(info.len(), 1);
+        assert!(info.contains_key(&123));
+        assert!(!info.contains_key(&456));
+    }
 }
 
 fn terminate_process(pid: i32) -> Result<()> {
@@ -470,7 +545,7 @@ fn update_tray_ui(tray: &mut TrayIcon, snap: &ProcessSnapshot) {
     }
 }
 
-fn rebuild_dynamic_menu(tray: &mut TrayIcon, snap: &ProcessSnapshot, menu_state: &Arc<Mutex<MenuState>>) {
+fn rebuild_dynamic_menu(tray: &mut TrayIcon, snap: &ProcessSnapshot, menu_state: &Arc<Mutex<MenuState>>, config: &Config) {
     // Recreate the menu fresh: process entries first, separator, then Kill All and Quit at bottom
     let menu = Menu::new();
 
@@ -495,6 +570,27 @@ fn rebuild_dynamic_menu(tray: &mut TrayIcon, snap: &ProcessSnapshot, menu_state:
     // Add separator
     let _ = menu.append(&PredefinedMenuItem::separator());
 
+    // Configuration options
+    let add_port = MenuItem::new("Add Port...", true, None);
+    let _ = menu.append(&add_port);
+
+    let remove_submenu = tray_icon::menu::Submenu::new("Remove Port", true);
+    let mut remove_ids = HashMap::new();
+    // Sort ports for the remove menu
+    let mut sorted_ports = config.ports.clone();
+    sorted_ports.sort_unstable();
+    
+    for port in sorted_ports {
+        let item = MenuItem::new(&port.to_string(), true, None);
+        let _ = remove_submenu.append(&item);
+        remove_ids.insert(item.id().clone(), port);
+    }
+    
+    let _ = menu.append(&remove_submenu);
+
+    // Add separator
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
     // Add Kill All and Quit at the bottom
     let kill_all = MenuItem::new("Kill All", true, None);
     let quit = MenuItem::new("Quit", true, None);
@@ -505,7 +601,29 @@ fn rebuild_dynamic_menu(tray: &mut TrayIcon, snap: &ProcessSnapshot, menu_state:
     if let Ok(mut state) = menu_state.lock() {
         state.kill_all = kill_all.id().clone();
         state.quit = quit.id().clone();
+        state.add_port = add_port.id().clone();
+        state.remove_port_ids = remove_ids;
     }
 
     let _ = tray.set_menu(Some(Box::new(menu)));
+}
+
+fn prompt_for_port() -> Option<u16> {
+    let script = r#"
+        set response to display dialog "Enter port number to monitor:" default answer "" with title "Add Port" buttons {"Cancel", "Add"} default button "Add"
+        text returned of response
+    "#;
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        u16::from_str(&text).ok()
+    } else {
+        None
+    }
 }
